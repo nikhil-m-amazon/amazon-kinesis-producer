@@ -97,6 +97,9 @@ set(TESTS_SOURCE
     aws/kinesis/core/test/ipc_manager_test.cc
     aws/kinesis/core/test/kinesis_record_test.cc
     aws/kinesis/core/test/limiter_test.cc
+    aws/kinesis/core/test/pipeline_auto_test.cc
+    aws/kinesis/core/test/pipeline_test_support.h
+    aws/kinesis/core/test/put_records_context_test.cc
     aws/kinesis/core/test/put_records_request_test.cc
     aws/kinesis/core/test/reducer_test.cc
     aws/kinesis/core/test/retrier_test.cc

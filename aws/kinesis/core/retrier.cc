@@ -199,6 +199,11 @@ bool Retrier::succeed_if_correct_shard(const std::shared_ptr<UserRecord>& ur,
                                        const bool should_invalidate_on_incorrect_shard,
                                        const boost::optional<std::pair<uint128_t, uint128_t>>& hashrange_actual_shard) {
   const uint64_t actual_shard = ShardMap::shard_id_from_str(shard_id);
+  // For AUTO and UNKNOWN streams, predicted_shard is always boost::none because
+  // the Pipeline routes those records through the solo path, which calls
+  // reset_predicted_shard(). The guard below is therefore skipped and the record
+  // succeeds regardless of which shard the service routed it to. Only confirmed
+  // USER_PARTITION_KEY records carry a predicted_shard and reach the comparison.
   if (ur->predicted_shard() && *ur->predicted_shard() != actual_shard) {
     // retry if shard is not found or hash key of the user record doesn't fit into the actual shard's hashrange
     if (!hashrange_actual_shard || 
