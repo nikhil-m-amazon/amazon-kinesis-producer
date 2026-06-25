@@ -101,6 +101,7 @@ set(TESTS_SOURCE
     aws/kinesis/core/test/limiter_test.cc
     aws/kinesis/core/test/pipeline_auto_test.cc
     aws/kinesis/core/test/pipeline_test_support.h
+    aws/kinesis/core/test/proto_contract_test.cc
     aws/kinesis/core/test/put_records_context_test.cc
     aws/kinesis/core/test/put_records_request_test.cc
     aws/kinesis/core/test/reducer_test.cc
@@ -108,6 +109,7 @@ set(TESTS_SOURCE
     aws/kinesis/core/test/shard_map_test.cc
     aws/kinesis/core/test/stream_id_cache_test.cc
     aws/kinesis/core/test/stream_strategy_manager_test.cc
+    aws/kinesis/core/test/strategy_pipeline_integration_test.cc
     aws/kinesis/core/test/test_utils.cc
     aws/kinesis/core/test/test_utils.h
     aws/kinesis/core/test/user_record_test.cc
