@@ -62,6 +62,9 @@ class Pipeline : boost::noncopyable {
   // client. Null in production.
   using PutRecordsHandler =
       std::function<void(const std::shared_ptr<PutRecordsContext>&)>;
+  // Notifies strategy discovery that a record landed on an unexpected shard.
+  // Receives the stream name. Null in production tests that don't care.
+  using WrongShardCallback = std::function<void(const std::string&)>;
 
   Pipeline(
       std::string region,
@@ -81,7 +84,9 @@ class Pipeline : boost::noncopyable {
       std::shared_ptr<ShardMap> shard_map = nullptr,
       // Optional test seam for intercepting the PutRecords send (see
       // PutRecordsHandler). Null in production.
-      PutRecordsHandler put_records_handler = nullptr)
+      PutRecordsHandler put_records_handler = nullptr,
+      // Notifies strategy discovery of a Wrong Shard event. Null = no-op.
+      WrongShardCallback wrong_shard_cb = nullptr)
       : stream_(std::move(stream)),
         region_(std::move(region)),
         stream_arn_(""),
@@ -89,6 +94,7 @@ class Pipeline : boost::noncopyable {
         stream_id_getter_(std::move(stream_id_getter)),
         stream_strategy_getter_(std::move(stream_strategy_getter)),
         put_records_handler_(std::move(put_records_handler)),
+        wrong_shard_cb_(std::move(wrong_shard_cb)),
         config_(std::move(config)),
         stats_logger_(stream_, config_->record_max_buffered_time()),
         executor_(std::move(executor)),
@@ -135,7 +141,12 @@ class Pipeline : boost::noncopyable {
                 [this](auto& code, auto& msg) {
                   limiter_->add_error(code, msg);
                 },
-                metrics_manager_)),
+                metrics_manager_,
+                [this](const std::string& stream_name) {
+                  if (wrong_shard_cb_) {
+                    wrong_shard_cb_(stream_name);
+                  }
+                })),
         user_records_rcvd_metric_(
             metrics_manager_
                 ->finder()
@@ -280,6 +291,7 @@ class Pipeline : boost::noncopyable {
   StreamIdGetter stream_id_getter_;
   StreamStrategyGetter stream_strategy_getter_;
   PutRecordsHandler put_records_handler_;
+  WrongShardCallback wrong_shard_cb_;
   std::shared_ptr<Configuration> config_;
   aws::utils::processing_statistics_logger stats_logger_;
   std::shared_ptr<aws::utils::Executor> executor_;

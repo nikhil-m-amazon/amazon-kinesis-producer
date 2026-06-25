@@ -356,6 +356,41 @@ BOOST_AUTO_TEST_CASE(WrongShard) {
   BOOST_CHECK_EQUAL(count, 1);
 }
 
+// On a Wrong Shard, the retrier notifies the wrong-shard callback with the
+// stream name (wired to strategy re-discovery in production).
+BOOST_AUTO_TEST_CASE(WrongShard_NotifiesCallback) {
+  auto ctx = make_prr_ctx(
+      1,
+      1,
+      success_outcome(R"(
+      {
+        "FailedRecordCount": 0,
+        "Records":[
+          {
+            "SequenceNumber":"1234",
+            "ShardId":"shardId-000000000004"
+          }
+        ]
+      }
+      )"));
+
+  std::vector<std::string> wrong_shard_streams;
+  aws::kinesis::core::Retrier retrier(
+      std::make_shared<aws::kinesis::core::Configuration>(),
+      [&](auto& ur) {},                       // finish
+      [&](auto& ur) {},                       // retry
+      [&](auto) { return boost::none; },      // hashrange
+      [&](auto, auto) {},                     // invalidate
+      aws::kinesis::core::Retrier::ErrorCallback(),
+      std::make_shared<aws::metrics::NullMetricsManager>(),
+      [&](const std::string& stream) { wrong_shard_streams.push_back(stream); });
+
+  retrier.put(ctx);
+
+  BOOST_REQUIRE_EQUAL(wrong_shard_streams.size(), 1u);
+  BOOST_CHECK_EQUAL(wrong_shard_streams[0], "myStream");
+}
+
 
 BOOST_AUTO_TEST_CASE(InvalidateForFirstUserRecordOnly) {
   auto ctx = make_prr_ctx(

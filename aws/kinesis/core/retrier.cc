@@ -211,6 +211,13 @@ bool Retrier::succeed_if_correct_shard(const std::shared_ptr<UserRecord>& ur,
       // invalidate because this is a new shard or shard felt outside of actual shards hashrange.
       invalidate_cache(ur, start, actual_shard, should_invalidate_on_incorrect_shard);
 
+      // Notify strategy discovery: a persistent Wrong Shard pattern can mean the
+      // stream's RecordDistributionStrategy changed (e.g. to AUTO) and we should
+      // re-check it rather than keep retrying against a stale prediction.
+      if (wrong_shard_cb_) {
+        wrong_shard_cb_(ur->stream());
+      }
+
       retry_not_expired(ur,
                         start,
                         end,

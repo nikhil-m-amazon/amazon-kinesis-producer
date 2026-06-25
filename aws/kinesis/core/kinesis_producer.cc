@@ -287,6 +287,14 @@ Pipeline* KinesisProducer::create_pipeline(const std::string& stream) {
       },
       [this](const std::string& stream_name) {
         return this->get_stream_id_from_cache(stream_name);
+      },
+      [this](const std::string& stream_name) {
+        return stream_strategy_manager_->get_strategy(stream_name);
+      },
+      /* shard_map */ nullptr,
+      /* put_records_handler */ nullptr,
+      [this](const std::string& stream_name) {
+        stream_strategy_manager_->record_wrong_shard(stream_name);
       });
 }
 
@@ -346,6 +354,11 @@ void KinesisProducer::on_put_record(aws::kinesis::protobuf::Message& m) {
       std::chrono::milliseconds(config_->record_max_buffered_time()));
   ur->set_expiration_from_now(
       std::chrono::milliseconds(config_->record_ttl()));
+  // First write to an undiscovered stream resolves its strategy before the
+  // record is routed (Decision 5). Returns immediately when a default is
+  // configured or the stream is already known; otherwise performs the bounded
+  // blocking DescribeStreamSummary attempt on this thread.
+  stream_strategy_manager_->get_or_discover(ur->stream());
   pipelines_[ur->stream()].put(ur);
 }
 
