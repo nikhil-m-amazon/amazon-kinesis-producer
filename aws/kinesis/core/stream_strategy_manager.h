@@ -152,6 +152,13 @@ class StreamStrategyManager : boost::noncopyable {
     StreamStrategy strategy = StreamStrategy::UNKNOWN;
     DiscoveryState discovery = DiscoveryState::kNotStarted;
     int wrong_shard_count = 0;
+    // True while a Wrong-Shard-triggered re-check (refresh_one) is in flight for
+    // this stream. Prevents a burst of near-simultaneous Wrong Shard retries from
+    // each submitting its own DescribeStreamSummary: during the ~hundreds of ms a
+    // re-check takes, dozens of retries can trip the threshold and would otherwise
+    // each fire a redundant DSS call (measured ~40 calls for one correction). With
+    // this guard only the first submits; the rest are suppressed until it returns.
+    bool recheck_in_flight = false;
   };
 
   // Applies a resolved strategy: updates the cache and fires on_change if it

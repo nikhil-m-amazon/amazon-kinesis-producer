@@ -297,6 +297,55 @@ BOOST_AUTO_TEST_CASE(WrongShard_CounterResetsAfterRecheck) {
   BOOST_CHECK_EQUAL(resolver->calls, 2);
 }
 
+// Wrong Shard re-check is debounced: while a re-check is in flight for a stream,
+// further bursts of wrong-shard hits do NOT submit additional re-checks (which
+// would each fire a redundant DescribeStreamSummary). Simulated by having the
+// resolver re-enter record_wrong_shard mid-call (i.e. wrong shards arriving
+// while the DSS call is outstanding); with the guard, only the first re-check's
+// resolver call happens.
+BOOST_AUTO_TEST_CASE(WrongShard_RecheckDebounced) {
+  auto executor = std::make_shared<FakeExecutor>();
+
+  // The resolver, on its first invocation, simulates a storm of wrong-shard
+  // retries arriving while this very re-check (DSS call) is still in flight.
+  // Without the in-flight guard each of these would trip the threshold and
+  // submit another re-check -> more resolver calls. With the guard they are
+  // suppressed, so the resolver is called exactly once.
+  StreamStrategyManager* mgr_ptr = nullptr;
+  int resolver_calls = 0;
+  auto resolver = [&](const std::string& s) -> boost::optional<StreamStrategy> {
+    if (++resolver_calls == 1) {
+      // Many more wrong shards than the threshold, all while in flight.
+      for (int i = 0; i < 30; i++) {
+        mgr_ptr->record_wrong_shard(s);
+      }
+    }
+    return StreamStrategy::AUTO;
+  };
+
+  StreamStrategyManager mgr(
+      executor, StreamStrategy::UNKNOWN, resolver,
+      [](const std::string&, StreamStrategy) {}, fast_timing());
+  mgr_ptr = &mgr;
+
+  // Trip the threshold once -> one re-check submitted -> resolver runs (inline),
+  // and during that run 30 more wrong shards arrive but must be suppressed.
+  mgr.record_wrong_shard("s");
+  mgr.record_wrong_shard("s");
+  mgr.record_wrong_shard("s");
+
+  // Exactly one resolver call despite the 30 in-flight wrong-shard hits.
+  BOOST_CHECK_EQUAL(resolver_calls, 1);
+  BOOST_CHECK(mgr.get_strategy("s") == StreamStrategy::AUTO);
+
+  // After the re-check completed the guard is cleared, so a fresh threshold of
+  // hits can trigger another re-check.
+  mgr.record_wrong_shard("s");
+  mgr.record_wrong_shard("s");
+  mgr.record_wrong_shard("s");
+  BOOST_CHECK_EQUAL(resolver_calls, 2);
+}
+
 // A scheduled refresh that observes a changed strategy fires the change
 // callback.
 BOOST_AUTO_TEST_CASE(Refresh_DetectsChange) {

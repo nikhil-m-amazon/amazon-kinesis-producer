@@ -110,7 +110,15 @@ void StreamStrategyManager::record_wrong_shard(const std::string& stream) {
     auto& entry = streams_[stream];
     if (++entry.wrong_shard_count >= kWrongShardThreshold) {
       entry.wrong_shard_count = 0;
-      trigger = true;
+      // Only submit a re-check if one is not already in flight for this stream.
+      // A burst of Wrong Shard retries (e.g. a wrong USER_PARTITION_KEY default on
+      // an AUTO stream) trips the threshold repeatedly while the first re-check's
+      // DescribeStreamSummary is still outstanding; without this guard each one
+      // fires its own redundant DSS call.
+      if (!entry.recheck_in_flight) {
+        entry.recheck_in_flight = true;
+        trigger = true;
+      }
     }
   }
   if (trigger) {
@@ -118,7 +126,12 @@ void StreamStrategyManager::record_wrong_shard(const std::string& stream) {
               << " Wrong Shard retries; re-checking its "
               << "RecordDistributionStrategy.";
     auto self_stream = stream;
-    executor_->submit([this, self_stream]() noexcept { refresh_one(self_stream); });
+    executor_->submit([this, self_stream]() noexcept {
+      refresh_one(self_stream);
+      // Re-check done (resolved or failed): allow the next one to be submitted.
+      aws::unique_lock<aws::shared_mutex> lock(mutex_);
+      streams_[self_stream].recheck_in_flight = false;
+    });
   }
 }
 
