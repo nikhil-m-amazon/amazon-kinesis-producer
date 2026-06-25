@@ -23,6 +23,8 @@
 #include <aws/core/client/AWSClient.h>
 #include <aws/core/client/DefaultRetryStrategy.h>
 #include <aws/core/http/Scheme.h>
+#include <aws/kinesis/model/DescribeStreamSummaryRequest.h>
+#include <aws/kinesis/model/RecordDistributionStrategy.h>
 #include <aws/kinesis/core/kinesis_producer.h>
 
 #include <system_error>
@@ -172,6 +174,74 @@ void KinesisProducer::create_metrics_manager() {
           granularity,
           std::move(extra_dims),
           std::chrono::milliseconds(config_->metrics_upload_delay()));
+}
+
+void KinesisProducer::create_stream_strategy_manager() {
+  StreamStrategyManager::Timing timing;
+  timing.refresh_interval =
+      std::chrono::milliseconds(config_->describe_stream_summary_interval());
+
+  auto default_strategy =
+      strategy_from_string(config_->record_distribution_strategy_default());
+
+  stream_strategy_manager_ = std::make_shared<StreamStrategyManager>(
+      executor_,
+      default_strategy,
+      [this](const std::string& stream) {
+        return this->resolve_stream_strategy(stream);
+      },
+      [this](const std::string& stream, StreamStrategy strategy) {
+        this->send_strategy_update_to_java(stream, strategy);
+      },
+      timing);
+}
+
+boost::optional<StreamStrategy> KinesisProducer::resolve_stream_strategy(
+    const std::string& stream) {
+  Aws::Kinesis::Model::DescribeStreamSummaryRequest req;
+  req.SetStreamName(stream);
+  std::string stream_id = get_stream_id_from_cache(stream);
+  if (!stream_id.empty()) {
+    req.SetStreamId(stream_id);
+  }
+
+  auto outcome = kinesis_client_->DescribeStreamSummary(req);
+  if (!outcome.IsSuccess()) {
+    LOG(warning) << "DescribeStreamSummary failed for stream \"" << stream
+                 << "\": " << outcome.GetError().GetExceptionName() << " - "
+                 << outcome.GetError().GetMessage();
+    return boost::none;
+  }
+
+  const auto& summary = outcome.GetResult().GetStreamDescriptionSummary();
+  if (!summary.RecordDistributionStrategyHasBeenSet()) {
+    // Field absent (older service / not an on-demand stream): treat as
+    // unresolved so the stream stays UNKNOWN rather than guessing.
+    return boost::none;
+  }
+
+  switch (summary.GetRecordDistributionStrategy()) {
+    case Aws::Kinesis::Model::RecordDistributionStrategy::AUTO:
+      return StreamStrategy::AUTO;
+    case Aws::Kinesis::Model::RecordDistributionStrategy::USER_PARTITION_KEY:
+      return StreamStrategy::USER_PARTITION_KEY;
+    case Aws::Kinesis::Model::RecordDistributionStrategy::NOT_SET:
+    default:
+      return boost::none;
+  }
+}
+
+void KinesisProducer::send_strategy_update_to_java(const std::string& stream,
+                                                   StreamStrategy strategy) {
+  aws::kinesis::protobuf::Message m;
+  m.set_id(::rand());
+  auto* update = m.mutable_stream_strategy_update();
+  update->set_stream_name(stream);
+  update->set_record_distribution_strategy(strategy_to_string(strategy));
+  ipc_manager_->put(m.SerializeAsString());
+  LOG(info) << "Reported RecordDistributionStrategy \""
+            << strategy_to_string(strategy) << "\" for stream \"" << stream
+            << "\" to the Java layer.";
 }
 
 void KinesisProducer::create_kinesis_client(const std::string& ca_path, const std::string& ca_file) {
