@@ -48,6 +48,9 @@ struct Harness {
   // KinesisRecords as assembled for sending, so tests can inspect the per-record
   // service_routed() flag that drives request assembly.
   std::shared_ptr<std::vector<std::shared_ptr<aws::kinesis::core::KinesisRecord>>> sent_krs;
+  // UserRecords the pipeline finished directly (e.g. the null-PK gate failing a
+  // record before it is ever sent), so tests can inspect the failure attempt.
+  std::shared_ptr<std::vector<std::shared_ptr<aws::kinesis::core::UserRecord>>> finished;
 };
 
 // Builds a real manager (with the given default + scripted resolver) wired to a
@@ -71,14 +74,17 @@ Harness make_harness(
 
   h.sent_krs = std::make_shared<
       std::vector<std::shared_ptr<aws::kinesis::core::KinesisRecord>>>();
+  h.finished = std::make_shared<
+      std::vector<std::shared_ptr<aws::kinesis::core::UserRecord>>>();
 
   auto manager = h.manager;
   auto sent = h.sent;
   auto sent_krs = h.sent_krs;
+  auto finished = h.finished;
   h.pipeline = std::make_shared<aws::kinesis::core::Pipeline>(
       "us-east-1", "myStream", config, h.executor, kinesis_client,
       metrics_manager,
-      [](auto&) {},
+      [finished](auto& ur) { finished->push_back(ur); },
       [](const std::string&) { return std::string(); },
       // strategy getter -> real manager (same as create_pipeline)
       [manager](const std::string& s) { return manager->get_strategy(s); },
@@ -182,6 +188,37 @@ BOOST_AUTO_TEST_CASE(StrategyFlipMidFlight_RecordKeepsFrozenAssembly) {
   BOOST_REQUIRE_EQUAL(h.sent_krs->size(), 1u);
   // Frozen at routing time despite the post-routing flip to UPK.
   BOOST_CHECK(h.sent_krs->front()->service_routed());
+}
+
+// A record with no partition key that is routed while the manager reports
+// USER_PARTITION_KEY must be failed, not aggregated and sent. This is the corner
+// case where a record submitted under a (wrong) AUTO assumption is retried after
+// discovery has corrected the stream to USER_PARTITION_KEY: without the gate it
+// would aggregate (acquiring the container's synthetic partition key) and land on
+// the stream. The pipeline must instead finish it with an InvalidPartitionKey
+// failure and send nothing.
+BOOST_AUTO_TEST_CASE(NullPK_OnUserPKStream_FailedNotSent) {
+  auto h = make_harness(
+      StreamStrategy::USER_PARTITION_KEY,
+      [](const std::string&) { return always(StreamStrategy::USER_PARTITION_KEY); });
+  BOOST_REQUIRE(h.manager->get_strategy("myStream") ==
+                StreamStrategy::USER_PARTITION_KEY);
+
+  auto ur = aws::kinesis::test::make_user_record_no_pk("data");
+  h.pipeline->put(ur);
+
+  // Failed directly, before any send: nothing aggregated, nothing sent.
+  BOOST_REQUIRE_EQUAL(h.finished->size(), 1u);
+  BOOST_CHECK(h.sent->empty());
+  BOOST_CHECK(h.sent_krs->empty());
+
+  // The failure carries the InvalidPartitionKey code and the Java-matching text.
+  auto& attempts = h.finished->front()->attempts();
+  BOOST_REQUIRE(!attempts.empty());
+  const auto& last = attempts.back();
+  BOOST_CHECK(!last);  // Attempt::operator bool() is false when errored
+  BOOST_CHECK_EQUAL(last.error_code(), "InvalidPartitionKey");
+  BOOST_CHECK_EQUAL(last.error_message(), "partitionKey cannot be null");
 }
 
 BOOST_AUTO_TEST_SUITE_END()

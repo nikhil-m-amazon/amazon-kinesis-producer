@@ -39,7 +39,12 @@ using aws::kinesis::test::kMockShardId;
 using aws::kinesis::test::MockShardMap;
 using aws::kinesis::test::leaked_pipelines;
 
-auto make_pipeline(StreamStrategy strategy) {
+using aws::kinesis::core::UserRecord;
+
+auto make_pipeline(
+    StreamStrategy strategy,
+    aws::kinesis::core::Retrier::UserRecordCallback finish_cb =
+        [](auto&) {}) {
   auto config = std::make_shared<aws::kinesis::core::Configuration>();
 
   auto executor = std::make_shared<aws::utils::IoServiceExecutor>(1);
@@ -54,7 +59,7 @@ auto make_pipeline(StreamStrategy strategy) {
       executor,
       kinesis_client,
       metrics_manager,
-      [](auto&) {},                                   // finish cb
+      std::move(finish_cb),                               // finish cb
       [](const std::string&) { return std::string(); },  // stream id getter
       [strategy](const std::string&) { return strategy; },
       std::make_shared<MockShardMap>(),
@@ -109,6 +114,31 @@ BOOST_AUTO_TEST_CASE(AutoStream_EmptyPK_NoAggregation) {
 
   BOOST_CHECK(!ur->predicted_shard());
   BOOST_CHECK(ur->partition_key().empty());
+}
+
+// USER_PARTITION_KEY with an empty partition key: the record must be failed at
+// route time (not aggregated), so an empty-PK record can never land on a
+// USER_PARTITION_KEY stream. This covers the case where a record was submitted
+// while the strategy still looked like AUTO and discovery later resolved the
+// stream to USER_PARTITION_KEY.
+BOOST_AUTO_TEST_CASE(UserPartitionKey_EmptyPK_Failed) {
+  std::shared_ptr<UserRecord> finished;
+  auto pipeline = make_pipeline(
+      StreamStrategy::USER_PARTITION_KEY,
+      [&finished](auto& ur) { finished = ur; });
+  auto ur = aws::kinesis::test::make_user_record_no_pk("data");
+
+  pipeline->put(ur);
+
+  // Failed synchronously at route time, not aggregated (no predicted shard).
+  BOOST_REQUIRE(finished);
+  BOOST_CHECK_EQUAL(finished.get(), ur.get());
+  BOOST_CHECK(!ur->predicted_shard());
+  BOOST_REQUIRE_EQUAL(ur->attempts().size(), 1u);
+  const auto& attempt = ur->attempts().back();
+  BOOST_CHECK(!attempt);  // errored attempt
+  BOOST_CHECK_EQUAL(attempt.error_code(), "InvalidPartitionKey");
+  BOOST_CHECK_EQUAL(attempt.error_message(), "partitionKey cannot be null");
 }
 
 BOOST_AUTO_TEST_SUITE_END()

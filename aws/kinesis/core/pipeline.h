@@ -196,8 +196,32 @@ class Pipeline : boost::noncopyable {
     // vs aggregated routing here, and request assembly later) keys off this one
     // snapshot via KinesisRecord::service_routed(), so a strategy flip mid-flight
     // can never produce a record that is routed one way but assembled the other.
-    bool service_routed =
-        stream_strategy_getter_(stream_) != StreamStrategy::USER_PARTITION_KEY;
+    StreamStrategy strategy = stream_strategy_getter_(stream_);
+
+    // A null/empty partition key is only valid on an AUTO stream, where the
+    // service routes records itself. The Java client rejects it synchronously
+    // when it already knows the stream is USER_PARTITION_KEY, but a record
+    // submitted while the strategy still looked like AUTO can slip past that
+    // check. If discovery later resolves the stream to USER_PARTITION_KEY, such a
+    // record must not be allowed to succeed: without this gate a retried empty-PK
+    // record would re-enter here, now aggregate (acquiring the aggregated
+    // container's synthetic partition key), and land on the stream, violating the
+    // invariant that a record with no partition key never lands on a
+    // USER_PARTITION_KEY stream. Fail it here instead, matching the Java client's
+    // wording.
+    if (strategy == StreamStrategy::USER_PARTITION_KEY &&
+        ur->partition_key().empty()) {
+      auto now = std::chrono::steady_clock::now();
+      ur->add_attempt(
+          Attempt()
+              .set_start(now)
+              .set_end(now)
+              .set_error("InvalidPartitionKey", "partitionKey cannot be null"));
+      finish_user_record(ur);
+      return;
+    }
+
+    bool service_routed = strategy != StreamStrategy::USER_PARTITION_KEY;
     // UNKNOWN or AUTO -> solo (the service routes the record itself); confirmed
     // USER_PARTITION_KEY -> existing shard-based aggregation. The solo path
     // reuses Aggregator's no-shard branch, which also clears predicted_shard so
