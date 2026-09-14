@@ -154,7 +154,7 @@ BOOST_AUTO_TEST_CASE(Undiscovered_PipelineSolo) {
 }
 
 // A strategy flip between routing and assembly must NOT change how an
-// already-routed record is sent (finding #5). The record is routed while the
+// already-routed record is sent. The record is routed while the
 // manager reports AUTO, so it is wrapped solo and frozen service_routed=true.
 // We then flip the manager to USER_PARTITION_KEY before the record is flushed
 // out for assembly. The assembled KinesisRecord must still report
@@ -219,6 +219,33 @@ BOOST_AUTO_TEST_CASE(NullPK_OnUserPKStream_FailedNotSent) {
   BOOST_CHECK(!last);  // Attempt::operator bool() is false when errored
   BOOST_CHECK_EQUAL(last.error_code(), "InvalidPartitionKey");
   BOOST_CHECK_EQUAL(last.error_message(), "partitionKey cannot be null");
+}
+
+// No default + discovery permanently fails (e.g. a version bump whose role lacks
+// kinesis:DescribeStreamSummary): the first-write blocking discovery exhausts
+// its attempts, the manager falls back to LEGACY_AGGREGATE, and the real
+// pipeline keeps aggregating -- the backward-compatibility guarantee end-to-end.
+BOOST_AUTO_TEST_CASE(DiscoveryFails_FallbackAggregates) {
+  StreamStrategyManager::Timing timing;
+  timing.blocking_backoff = std::chrono::milliseconds(1);  // keep the test fast
+  auto h = make_harness(
+      StreamStrategy::UNKNOWN,
+      [](const std::string&) { return boost::optional<StreamStrategy>(); },
+      timing);
+
+  // First-write discovery: every attempt fails -> fall back to LEGACY_AGGREGATE.
+  BOOST_REQUIRE(h.manager->get_or_discover("myStream") ==
+                StreamStrategy::LEGACY_AGGREGATE);
+  BOOST_REQUIRE(h.manager->get_strategy("myStream") ==
+                StreamStrategy::LEGACY_AGGREGATE);
+
+  auto ur = aws::kinesis::test::make_user_record("pk", "data");
+  h.pipeline->put(ur);
+
+  // Aggregates like a USER_PARTITION_KEY stream (predicted shard set), rather
+  // than silently dropping to solo.
+  BOOST_REQUIRE(ur->predicted_shard());
+  BOOST_CHECK_EQUAL(*ur->predicted_shard(), kMockShardId);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

@@ -108,7 +108,7 @@ class KinesisProducer : boost::noncopyable {
       const std::string& stream);
 
   // Sends a StreamStrategyUpdate IPC message to Java reporting a stream's
-  // discovered or changed strategy (see Decision 7).
+  // discovered or changed strategy.
   void send_strategy_update_to_java(const std::string& stream,
                                     StreamStrategy strategy);
 

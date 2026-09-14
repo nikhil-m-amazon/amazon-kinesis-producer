@@ -47,7 +47,8 @@ inline StreamStrategy strategy_from_string(const std::string& s) {
   return StreamStrategy::UNKNOWN;
 }
 
-// Maps a StreamStrategy to its wire string. UNKNOWN -> empty string.
+// Maps a StreamStrategy to its wire string. UNKNOWN and the internal
+// LEGACY_AGGREGATE fallback (never sent) -> empty string.
 inline std::string strategy_to_string(StreamStrategy strategy) {
   switch (strategy) {
     case StreamStrategy::AUTO:
@@ -55,23 +56,33 @@ inline std::string strategy_to_string(StreamStrategy strategy) {
     case StreamStrategy::USER_PARTITION_KEY:
       return kStrategyUserPartitionKey;
     case StreamStrategy::UNKNOWN:
+    case StreamStrategy::LEGACY_AGGREGATE:
       break;
   }
   return "";
+}
+
+// True for a real DescribeStreamSummary result, false for the pre-discovery
+// UNKNOWN state and the LEGACY_AGGREGATE fallback (both "not yet discovered").
+// Lets background recovery tell whether discovery still needs to make progress.
+inline bool is_discovered_strategy(StreamStrategy s) {
+  return s == StreamStrategy::AUTO || s == StreamStrategy::USER_PARTITION_KEY;
 }
 
 // Discovers and caches each stream's RecordDistributionStrategy, and notifies a
 // listener (Java, via StreamStrategyUpdate) when a stream's strategy is first
 // resolved or later changes.
 //
-// Behavior (see the AUTO design doc, Decision 5/7):
+// Behavior:
 //   - If a customer default is configured, every stream starts at that default
 //     and discovery only corrects drift in the background.
 //   - With no default, a stream starts UNKNOWN. The first write triggers a
 //     bounded blocking discovery (a few attempts with backoff); on success the
-//     strategy is cached, on failure the stream stays UNKNOWN and a background
-//     recovery is scheduled. Either way records flow solo while UNKNOWN, which
-//     is safe.
+//     strategy is cached (records flow solo while UNKNOWN, which is safe). On
+//     failure the stream falls back to LEGACY_AGGREGATE -- it keeps aggregating
+//     like the pre-AUTO KPL, so a version bump lacking the DescribeStreamSummary
+//     permission doesn't silently drop aggregation -- and a background recovery
+//     is scheduled to replace it with the real strategy.
 //   - A periodic refresh re-checks each stream for drift.
 //   - A reactive Wrong Shard trigger forces an immediate re-check when a stream
 //     accumulates consecutive Wrong Shard retries (a hint the strategy changed).
@@ -127,8 +138,9 @@ class StreamStrategyManager : boost::noncopyable {
   // Called on a stream's first write. If a default is configured the strategy is
   // already known and this returns immediately. With no default and an
   // undiscovered stream, runs a bounded blocking discovery and returns the
-  // resolved strategy (or UNKNOWN on failure, scheduling background recovery).
-  // Idempotent and safe under concurrent first writes for the same stream.
+  // resolved strategy (or LEGACY_AGGREGATE on failure, scheduling background
+  // recovery). Idempotent and safe under concurrent first writes for the same
+  // stream.
   StreamStrategy get_or_discover(const std::string& stream);
 
   // Records a Wrong Shard retry for a stream. After kWrongShardThreshold

@@ -141,4 +141,34 @@ BOOST_AUTO_TEST_CASE(UserPartitionKey_EmptyPK_Failed) {
   BOOST_CHECK_EQUAL(attempt.error_message(), "partitionKey cannot be null");
 }
 
+// LEGACY_AGGREGATE (backward-compat fallback used when discovery fails with no
+// configured default): aggregates just like USER_PARTITION_KEY, so a version
+// bump missing the DescribeStreamSummary permission keeps aggregating.
+BOOST_AUTO_TEST_CASE(LegacyAggregate_Aggregates) {
+  auto pipeline = make_pipeline(StreamStrategy::LEGACY_AGGREGATE);
+  auto ur = aws::kinesis::test::make_user_record("pk", "data");
+
+  pipeline->put(ur);
+
+  BOOST_REQUIRE(ur->predicted_shard());
+  BOOST_CHECK_EQUAL(*ur->predicted_shard(), kMockShardId);
+}
+
+// LEGACY_AGGREGATE with an empty partition key: unlike a confirmed
+// USER_PARTITION_KEY, the record is NOT failed at route time. The fallback
+// preserves pre-AUTO behavior (empty-PK records were accepted) since the
+// stream's real strategy is still unknown; it still aggregates.
+BOOST_AUTO_TEST_CASE(LegacyAggregate_EmptyPK_NotFailed) {
+  std::shared_ptr<UserRecord> finished;
+  auto pipeline = make_pipeline(
+      StreamStrategy::LEGACY_AGGREGATE,
+      [&finished](auto& ur) { finished = ur; });
+  auto ur = aws::kinesis::test::make_user_record_no_pk("data");
+
+  pipeline->put(ur);
+
+  BOOST_CHECK(!finished);            // not failed at route time
+  BOOST_REQUIRE(ur->predicted_shard());  // took the aggregating path
+}
+
 BOOST_AUTO_TEST_SUITE_END()

@@ -89,18 +89,27 @@ StreamStrategy StreamStrategyManager::get_or_discover(
     }
   }
 
-  // All blocking attempts failed: stay UNKNOWN (records flow solo, which is
-  // safe) and hand off to background recovery.
+  // All blocking attempts failed and the strategy is unknown (no default). Solo
+  // would silently drop aggregation on a version bump (the pre-AUTO KPL always
+  // aggregated) -- typically when the role lacks kinesis:DescribeStreamSummary.
+  // Fall back to LEGACY_AGGREGATE: keep aggregating while background recovery
+  // discovers the real strategy. No-default case only; an explicit default is
+  // seeded up front and never reaches here.
   LOG(warning) << "Could not determine RecordDistributionStrategy for stream \""
                << stream << "\" after " << timing_.blocking_max_attempts
-               << " attempts; proceeding without aggregation until discovery "
-               << "succeeds.";
+               << " attempts (check that the KPL role is granted "
+               << "kinesis:DescribeStreamSummary); falling back to aggregation "
+               << "for backward compatibility until discovery succeeds.";
   {
     aws::unique_lock<aws::shared_mutex> lock(mutex_);
-    streams_[stream].discovery = DiscoveryState::kDone;
+    auto& entry = streams_[stream];
+    // No on_change_: the fallback is not confirmed, so Java is not told (it must
+    // not start rejecting empty PKs as it would for a real USER_PARTITION_KEY).
+    entry.strategy = StreamStrategy::LEGACY_AGGREGATE;
+    entry.discovery = DiscoveryState::kDone;
   }
   schedule_recovery(stream, 0);
-  return StreamStrategy::UNKNOWN;
+  return StreamStrategy::LEGACY_AGGREGATE;
 }
 
 void StreamStrategyManager::record_wrong_shard(const std::string& stream) {
@@ -179,12 +188,13 @@ void StreamStrategyManager::schedule_recovery(const std::string& stream,
       [this, self_stream, attempt]() noexcept {
         auto before = get_strategy(self_stream);
         refresh_one(self_stream);
-        if (get_strategy(self_stream) == StreamStrategy::UNKNOWN &&
-            before == StreamStrategy::UNKNOWN) {
-          // Still unresolved: try the next, longer backoff.
+        if (!is_discovered_strategy(get_strategy(self_stream)) &&
+            !is_discovered_strategy(before)) {
+          // Still unresolved (UNKNOWN or the LEGACY_AGGREGATE fallback): try the
+          // next, longer backoff rather than dropping to the steady refresh.
           schedule_recovery(self_stream, attempt + 1);
         } else {
-          // Resolved; resume steady-state drift checks.
+          // Resolved to a real strategy; resume steady-state drift checks.
           schedule_refresh(self_stream);
         }
       },

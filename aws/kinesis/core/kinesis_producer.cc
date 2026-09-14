@@ -355,9 +355,9 @@ void KinesisProducer::on_put_record(aws::kinesis::protobuf::Message& m) {
   ur->set_expiration_from_now(
       std::chrono::milliseconds(config_->record_ttl()));
   // First write to an undiscovered stream resolves its strategy before the
-  // record is routed (Decision 5). Returns immediately when a default is
-  // configured or the stream is already known; otherwise performs the bounded
-  // blocking DescribeStreamSummary attempt on this thread.
+  // record is routed. Returns immediately when a default is configured or the
+  // stream is already known; otherwise performs the bounded blocking
+  // DescribeStreamSummary attempt on this thread.
   stream_strategy_manager_->get_or_discover(ur->stream());
   pipelines_[ur->stream()].put(ur);
 }

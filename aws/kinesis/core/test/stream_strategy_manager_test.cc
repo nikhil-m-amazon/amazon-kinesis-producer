@@ -131,6 +131,8 @@ BOOST_AUTO_TEST_CASE(StrategyStringRoundTrip) {
   BOOST_CHECK_EQUAL(strategy_to_string(StreamStrategy::USER_PARTITION_KEY),
                     "USER_PARTITION_KEY");
   BOOST_CHECK_EQUAL(strategy_to_string(StreamStrategy::UNKNOWN), "");
+  // The LEGACY_AGGREGATE fallback has no wire form (never sent to Java/service).
+  BOOST_CHECK_EQUAL(strategy_to_string(StreamStrategy::LEGACY_AGGREGATE), "");
 }
 
 // Default = AUTO: get_or_discover returns AUTO immediately without a blocking
@@ -203,9 +205,33 @@ BOOST_AUTO_TEST_CASE(NoDefault_RetriesThenSucceeds) {
   BOOST_CHECK_EQUAL(resolver->calls, 2);  // failed once, then succeeded
 }
 
-// No default: all blocking attempts fail; stream stays UNKNOWN and a recovery is
-// scheduled.
-BOOST_AUTO_TEST_CASE(NoDefault_AllFail_RemainsUnknown) {
+// No default: all blocking attempts fail; the stream falls back to
+// LEGACY_AGGREGATE (backward compat: keep aggregating) and a recovery is
+// scheduled. The fallback is NOT reported to Java (no change callback).
+BOOST_AUTO_TEST_CASE(NoDefault_AllFail_FallsBackToAggregate) {
+  auto executor = std::make_shared<FakeExecutor>();
+  auto resolver = std::make_shared<RecordingResolver>(
+      std::deque<boost::optional<StreamStrategy>>{});  // always none
+  ChangeRecorder changes;
+
+  StreamStrategyManager mgr(
+      executor, StreamStrategy::UNKNOWN,
+      [resolver](const std::string& s) { return (*resolver)(s); },
+      [&changes](const std::string& s, StreamStrategy st) { changes(s, st); },
+      fast_timing());
+
+  BOOST_CHECK(mgr.get_or_discover("s") == StreamStrategy::LEGACY_AGGREGATE);
+  BOOST_CHECK(mgr.get_strategy("s") == StreamStrategy::LEGACY_AGGREGATE);
+  BOOST_CHECK_EQUAL(resolver->calls, 3);       // blocking_max_attempts
+  BOOST_CHECK(!executor->scheduled.empty());   // recovery scheduled
+  BOOST_CHECK(changes.changes.empty());        // fallback not reported to Java
+}
+
+// No default + discovery keeps failing: after falling back to LEGACY_AGGREGATE,
+// recovery keeps retrying on the recovery backoff. It must NOT prematurely drop
+// to the (much longer) steady-state refresh just because a fallback strategy is
+// now set -- LEGACY_AGGREGATE still counts as "not discovered".
+BOOST_AUTO_TEST_CASE(NoDefault_FallbackRecoveryKeepsRetrying) {
   auto executor = std::make_shared<FakeExecutor>();
   auto resolver = std::make_shared<RecordingResolver>(
       std::deque<boost::optional<StreamStrategy>>{});  // always none
@@ -216,9 +242,71 @@ BOOST_AUTO_TEST_CASE(NoDefault_AllFail_RemainsUnknown) {
       [](const std::string&, StreamStrategy) {},
       fast_timing());
 
-  BOOST_CHECK(mgr.get_or_discover("s") == StreamStrategy::UNKNOWN);
-  BOOST_CHECK_EQUAL(resolver->calls, 3);  // blocking_max_attempts
-  BOOST_CHECK(!executor->scheduled.empty());  // recovery scheduled
+  BOOST_CHECK(mgr.get_or_discover("s") == StreamStrategy::LEGACY_AGGREGATE);
+  // First recovery scheduled at recovery_backoff[0] (5s).
+  BOOST_REQUIRE_EQUAL(executor->scheduled.size(), 1u);
+  BOOST_CHECK(executor->scheduled.front().delay ==
+              std::chrono::milliseconds(5000));
+
+  // Run it; still fails, so it schedules the next recovery at 15s (not the 300s
+  // steady refresh), and the stream stays on the fallback.
+  executor->run_next_scheduled();
+  BOOST_REQUIRE_EQUAL(executor->scheduled.size(), 1u);
+  BOOST_CHECK(executor->scheduled.front().delay ==
+              std::chrono::milliseconds(15000));
+  BOOST_CHECK(mgr.get_strategy("s") == StreamStrategy::LEGACY_AGGREGATE);
+}
+
+// No default: blocking discovery fails, the stream falls back to
+// LEGACY_AGGREGATE, and background recovery later resolves the real strategy
+// (USER_PARTITION_KEY). The switch to a confirmed strategy fires the change
+// callback (Java is now told), unlike the silent fallback.
+BOOST_AUTO_TEST_CASE(NoDefault_FallbackThenRecoversToUserPK) {
+  auto executor = std::make_shared<FakeExecutor>();
+  // Three blocking failures, then recovery resolves USER_PARTITION_KEY.
+  auto resolver = std::make_shared<RecordingResolver>(
+      std::deque<boost::optional<StreamStrategy>>{
+          boost::none, boost::none, boost::none,
+          StreamStrategy::USER_PARTITION_KEY});
+  ChangeRecorder changes;
+
+  StreamStrategyManager mgr(
+      executor, StreamStrategy::UNKNOWN,
+      [resolver](const std::string& s) { return (*resolver)(s); },
+      [&changes](const std::string& s, StreamStrategy st) { changes(s, st); },
+      fast_timing());
+
+  BOOST_CHECK(mgr.get_or_discover("s") == StreamStrategy::LEGACY_AGGREGATE);
+  BOOST_CHECK(changes.changes.empty());  // fallback is silent
+
+  // Run the scheduled recovery: it resolves UPK and reports the change.
+  BOOST_REQUIRE(executor->run_next_scheduled());
+  BOOST_CHECK(mgr.get_strategy("s") == StreamStrategy::USER_PARTITION_KEY);
+  BOOST_REQUIRE_EQUAL(changes.changes.size(), 1u);
+  BOOST_CHECK(changes.changes[0].second == StreamStrategy::USER_PARTITION_KEY);
+}
+
+// Same, but recovery resolves AUTO: the stream switches off aggregation (from
+// the LEGACY_AGGREGATE fallback to AUTO) once discovery succeeds.
+BOOST_AUTO_TEST_CASE(NoDefault_FallbackThenRecoversToAuto) {
+  auto executor = std::make_shared<FakeExecutor>();
+  auto resolver = std::make_shared<RecordingResolver>(
+      std::deque<boost::optional<StreamStrategy>>{
+          boost::none, boost::none, boost::none, StreamStrategy::AUTO});
+  ChangeRecorder changes;
+
+  StreamStrategyManager mgr(
+      executor, StreamStrategy::UNKNOWN,
+      [resolver](const std::string& s) { return (*resolver)(s); },
+      [&changes](const std::string& s, StreamStrategy st) { changes(s, st); },
+      fast_timing());
+
+  BOOST_CHECK(mgr.get_or_discover("s") == StreamStrategy::LEGACY_AGGREGATE);
+
+  BOOST_REQUIRE(executor->run_next_scheduled());
+  BOOST_CHECK(mgr.get_strategy("s") == StreamStrategy::AUTO);
+  BOOST_REQUIRE_EQUAL(changes.changes.size(), 1u);
+  BOOST_CHECK(changes.changes[0].second == StreamStrategy::AUTO);
 }
 
 // A second first-write while discovery is done does not re-run the blocking

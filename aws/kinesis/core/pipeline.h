@@ -43,11 +43,19 @@ namespace core {
 // DescribeStreamSummary (or seeded from the customer-configured default).
 // UNKNOWN means the strategy has not been determined yet; it is treated like
 // AUTO for record handling (no aggregation), which is safe for both stream
-// types. Only a confirmed USER_PARTITION_KEY stream aggregates.
+// types. A confirmed USER_PARTITION_KEY stream aggregates, as does the
+// LEGACY_AGGREGATE backward-compat fallback (below).
 enum class StreamStrategy {
   UNKNOWN,
   AUTO,
-  USER_PARTITION_KEY
+  USER_PARTITION_KEY,
+  // Backward-compat fallback when no default is configured and discovery fails
+  // (e.g. the role lacks kinesis:DescribeStreamSummary after a version bump).
+  // Aggregates like the pre-AUTO KPL so an upgrade never silently loses
+  // aggregation. Unlike USER_PARTITION_KEY it does not reject empty partition
+  // keys and is never reported to Java (the real strategy is still unknown);
+  // background discovery replaces it once it succeeds.
+  LEGACY_AGGREGATE
 };
 
 class Pipeline : boost::noncopyable {
@@ -75,8 +83,8 @@ class Pipeline : boost::noncopyable {
       std::shared_ptr<aws::metrics::MetricsManager> metrics_manager,
       Retrier::UserRecordCallback finish_user_record_cb,
       StreamIdGetter stream_id_getter,
-      // Defaults to USER_PARTITION_KEY so behavior is unchanged until the real
-      // DSS-backed getter is wired in (CR5). Tests inject their own getter.
+      // Defaults to USER_PARTITION_KEY so behavior is unchanged when no
+      // DSS-backed getter is supplied. Production and tests inject their own.
       StreamStrategyGetter stream_strategy_getter =
           [](const std::string&) { return StreamStrategy::USER_PARTITION_KEY; },
       // Optional injected ShardMap (tests). When null, the Pipeline creates its
@@ -221,11 +229,13 @@ class Pipeline : boost::noncopyable {
       return;
     }
 
-    bool service_routed = strategy != StreamStrategy::USER_PARTITION_KEY;
-    // UNKNOWN or AUTO -> solo (the service routes the record itself); confirmed
-    // USER_PARTITION_KEY -> existing shard-based aggregation. The solo path
-    // reuses Aggregator's no-shard branch, which also clears predicted_shard so
-    // the retrier skips the Wrong Shard comparison.
+    // USER_PARTITION_KEY and the LEGACY_AGGREGATE fallback aggregate; UNKNOWN or
+    // AUTO -> solo (the service routes the record). The solo path reuses
+    // Aggregator's no-shard branch, which clears predicted_shard so the retrier
+    // skips the Wrong Shard comparison.
+    bool aggregate = strategy == StreamStrategy::USER_PARTITION_KEY ||
+                     strategy == StreamStrategy::LEGACY_AGGREGATE;
+    bool service_routed = !aggregate;
     auto kr = aggregator_->put(ur, /*force_solo=*/service_routed);
     if (kr) {
       kr->set_service_routed(service_routed);
