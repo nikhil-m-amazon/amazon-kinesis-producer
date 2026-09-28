@@ -55,6 +55,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Stream;
 
 import static org.junit.Assert.assertEquals;
@@ -183,6 +185,91 @@ public class KinesisProducerTest {
 
         assertTrue(counts.get(AKID_A).get() > 1);
         assertTrue(counts.get(AKID_B).get() > 1);
+    }
+
+    //
+    // Names a recorded request's API and the key that signed it, without printing the signature.
+    //
+    private static String describeRequest(org.mockserver.model.HttpRequest httpRequest, String auth, String... testKeys) {
+        String target = httpRequest.getFirstHeader("X-Amz-Target");
+        String api = (target == null || target.isEmpty()) ? httpRequest.getPath().getValue() : target;
+        String name = api.substring(Math.max(api.lastIndexOf('/'), api.lastIndexOf('.')) + 1);
+        if (!name.isEmpty()) {
+            api = name;
+        }
+        if (!auth.contains("Credential=")) {
+            return api + " unsigned";
+        }
+        String key = "another key";
+        for (String testKey : testKeys) {
+            if (auth.contains("Credential=" + testKey + "/")) {
+                key = testKey;
+            }
+        }
+        Matcher scope = Pattern.compile("Credential=[^/]+/[^/]+/[^/]+/([^/]+)/").matcher(auth);
+        return api + " signed with " + key + " for " + (scope.find() ? scope.group(1) : "an unknown service");
+    }
+
+    @Test
+    public void recordsAndMetricsUseTheirOwnCredentialsOnOnePooledThread() throws InterruptedException, ExecutionException {
+        final String AKID_A = "AKIAAAAAAAAAAAAAAAAA";
+        final String AKID_B = "AKIABBBBBBBBBBBBBBBB";
+
+        //
+        // With one pooled thread, the Kinesis and CloudWatch clients sign every request on the same thread.
+        //
+        final KinesisProducer kp = new KinesisProducer(buildBasicConfiguration()
+                .setThreadingModel(KinesisProducerConfiguration.ThreadingModel.POOLED)
+                .setThreadPoolSize(1)
+                .setCredentialsProvider(StaticCredentialsProvider.create(
+                        AwsBasicCredentials.create(AKID_A, StringUtils.repeat("a", 40))))
+                .setMetricsCredentialsProvider(StaticCredentialsProvider.create(
+                        AwsBasicCredentials.create(AKID_B, StringUtils.repeat("b", 40)))));
+
+        final long start = System.nanoTime();
+        while (System.nanoTime() - start < 500 * 1000000) {
+            kp.addUserRecord("streamName", "partitionKey", ByteBuffer.wrap(new byte[0]));
+            kp.flush();
+            Thread.sleep(10);
+        }
+
+        kp.flushSync();
+        Thread.sleep(1000);
+        kp.destroy();
+
+        //
+        // Both endpoints are localhost, so the service in the SigV4 credential scope is what tells a
+        // Kinesis request from a CloudWatch one.
+        //
+        org.mockserver.model.HttpRequest[] recorded = mockServer.retrieveRecordedRequests(request());
+        List<String> mismatches = new ArrayList<>();
+        int kinesisRequests = 0;
+        int cloudwatchRequests = 0;
+        for (int i = 0; i < recorded.length; i++) {
+            org.mockserver.model.HttpRequest httpRequest = recorded[i];
+            String auth = Stream.of("Authorization", "authorization")
+                    .map(headKey -> httpRequest.getHeaders().getValues(headKey).toString())
+                    .findFirst().get();
+            boolean ownCredentials = false;
+            if (auth.contains("/kinesis/aws4_request")) {
+                kinesisRequests++;
+                ownCredentials = auth.contains(AKID_A + "/");
+            } else if (auth.contains("/monitoring/aws4_request")) {
+                cloudwatchRequests++;
+                ownCredentials = auth.contains(AKID_B + "/");
+            }
+            if (!ownCredentials) {
+                mismatches.add("#" + (i + 1) + " " + describeRequest(httpRequest, auth, AKID_A, AKID_B));
+            }
+        }
+
+        if (!mismatches.isEmpty()) {
+            fail(mismatches.size() + " of " + recorded.length
+                    + " requests were not signed with their own client's credentials: "
+                    + String.join(", ", mismatches));
+        }
+        assertTrue(kinesisRequests > 1);
+        assertTrue(cloudwatchRequests > 1);
     }
 
     @Test

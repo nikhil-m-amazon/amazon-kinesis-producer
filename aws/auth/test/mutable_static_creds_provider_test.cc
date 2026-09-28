@@ -245,4 +245,30 @@ BOOST_AUTO_TEST_CASE(EnablingTheWaitAfterCredentialsArrivedDoesNotWait) {
   BOOST_CHECK(read_time < std::chrono::milliseconds(100));
 }
 
+//
+// With ThreadingModel POOLED the Kinesis and CloudWatch clients sign requests on the same
+// threads, and Java updates both providers together, so their versions match. Each provider
+// must still return its own credentials on a thread that has read from the other.
+//
+BOOST_AUTO_TEST_CASE(ProvidersOnOneThreadReturnTheirOwnCredentials) {
+  aws::auth::MutableStaticCredentialsProvider kinesis(std::chrono::milliseconds(5000));
+  aws::auth::MutableStaticCredentialsProvider cloudwatch(std::chrono::milliseconds(5000));
+  kinesis.set_credentials("kinesis-akid", "kinesis-sk");
+  cloudwatch.set_credentials("cloudwatch-akid", "cloudwatch-sk");
+
+  Aws::Auth::AWSCredentials first_kinesis;
+  Aws::Auth::AWSCredentials first_cloudwatch;
+  Aws::Auth::AWSCredentials second_kinesis;
+  std::thread reader([&] {
+      first_kinesis = kinesis.GetAWSCredentials();
+      first_cloudwatch = cloudwatch.GetAWSCredentials();
+      second_kinesis = kinesis.GetAWSCredentials();
+    });
+  reader.join();
+
+  BOOST_CHECK_EQUAL(first_kinesis.GetAWSAccessKeyId(), "kinesis-akid");
+  BOOST_CHECK_EQUAL(first_cloudwatch.GetAWSAccessKeyId(), "cloudwatch-akid");
+  BOOST_CHECK_EQUAL(second_kinesis.GetAWSAccessKeyId(), "kinesis-akid");
+}
+
 BOOST_AUTO_TEST_SUITE_END()

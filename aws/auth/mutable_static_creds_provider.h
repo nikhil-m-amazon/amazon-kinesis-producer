@@ -28,11 +28,12 @@ namespace aws {
 namespace auth {
 
 struct VersionedCredentials {
+  std::uint64_t provider_id_;
   std::uint64_t version_;
   Aws::Auth::AWSCredentials creds_;
 
-  VersionedCredentials() : version_(0), creds_("", "", "") {}
-  VersionedCredentials(std::uint64_t version, const std::string& akid, const std::string& sk, const std::string& token);
+  VersionedCredentials() : provider_id_(0), version_(0), creds_("", "", "") {}
+  VersionedCredentials(std::uint64_t provider_id, std::uint64_t version, const std::string& akid, const std::string& sk, const std::string& token);
 };
 
 // Like basic static creds, but with an atomic set operation
@@ -59,6 +60,8 @@ class MutableStaticCredentialsProvider
   void wait_for_first_credentials();
 
   std::mutex update_mutex_;
+  // Tells this provider's credentials apart in the thread local copy, which all providers share
+  const std::uint64_t id_;
   std::shared_ptr<VersionedCredentials> creds_;
   std::atomic<std::uint64_t> version_;
   std::atomic<bool> awaiting_first_credentials_;
